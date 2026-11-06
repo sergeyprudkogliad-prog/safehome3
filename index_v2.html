@@ -1,0 +1,239 @@
+import asyncio
+import logging
+import os
+import time
+
+import aiohttp
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import Command, CommandObject, CommandStart
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    LabeledPrice,
+    Message,
+    PreCheckoutQuery,
+    WebAppInfo,
+)
+
+# pip install aiogram
+# Переменные окружения: BOT_TOKEN, WEBAPP_URL, PANEL_URL, PANEL_USER, PANEL_PASS
+TOKEN = os.getenv("BOT_TOKEN")
+WEBAPP_URL = os.getenv("WEBAPP_URL", "https://sergeyprudkogliad-prog.github.io/safehome2/")
+PANEL_URL = os.getenv("PANEL_URL", "").rstrip("/")  # например https://panel.example.com:8000
+PANEL_USER = os.getenv("PANEL_USER", "")
+PANEL_PASS = os.getenv("PANEL_PASS", "")
+
+# id: (название, дней, цена в Telegram Stars) — цены поставь свои
+PLANS = {
+    "solo1": ("Один · 1 месяц", 30, 150),
+    "solo3": ("Один · 3 месяца", 90, 400),
+    "fam1": ("Семья (до 5 устр.) · 1 месяц", 30, 350),
+    "fam3": ("Семья (до 5 устр.) · 3 месяца", 90, 950),
+}
+
+dp = Dispatcher()
+
+
+class Marzban:
+    def __init__(self):
+        self.token = None
+
+    async def _login(self, s):
+        async with s.post(
+            f"{PANEL_URL}/api/admin/token",
+            data={"username": PANEL_USER, "password": PANEL_PASS},
+        ) as r:
+            r.raise_for_status()
+            self.token = (await r.json())["access_token"]
+
+    async def _req(self, method, path, **kw):
+        async with aiohttp.ClientSession() as s:
+            for attempt in (1, 2):
+                if not self.token:
+                    await self._login(s)
+                headers = {"Authorization": f"Bearer {self.token}"}
+                async with s.request(method, PANEL_URL + path, headers=headers, **kw) as r:
+                    if r.status == 401 and attempt == 1:
+                        self.token = None
+                        continue
+                    if r.status == 404:
+                        return None
+                    r.raise_for_status()
+                    return await r.json()
+
+    async def get_user(self, username):
+        return await self._req("GET", f"/api/user/{username}")
+
+    async def grant(self, username, days):
+        """Создаёт пользователя или продлевает подписку."""
+        now = int(time.time())
+        user = await self.get_user(username)
+        if user:
+            base = max(user.get("expire") or 0, now)
+            return await self._req(
+                "PUT",
+                f"/api/user/{username}",
+                json={"expire": base + days * 86400, "status": "active"},
+            )
+        return await self._req(
+            "POST",
+            "/api/user",
+            json={
+                "username": username,
+                "proxies": {"vless": {"flow": "xtls-rprx-vision"}},
+                "expire": now + days * 86400,
+                "data_limit": 0,  # 0 = безлимит
+                "status": "active",
+            },
+        )
+
+
+panel = Marzban()
+
+
+def uname(user_id: int) -> str:
+    return f"tg_{user_id}"
+
+
+def sub_link(user: dict) -> str:
+    url = user.get("subscription_url", "")
+    return url if url.startswith("http") else PANEL_URL + url
+
+
+def main_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🏠 Открыть SafeHome", web_app=WebAppInfo(url=WEBAPP_URL))],
+            [InlineKeyboardButton(text="💳 Купить подписку", callback_data="tariffs")],
+            [InlineKeyboardButton(text="🔑 Мой ключ", callback_data="key")],
+        ]
+    )
+
+
+def tariffs_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=f"{n} — {p} ⭐", callback_data=f"buy:{pid}")]
+            for pid, (n, _d, p) in PLANS.items()
+        ]
+    )
+
+
+async def send_invoice(message: Message, pid: str):
+    name, _days, price = PLANS[pid]
+    await message.answer_invoice(
+        title=f"SafeHome — {name}",
+        description="Безлимитный VPN. Подписка активируется сразу после оплаты.",
+        payload=pid,
+        currency="XTR",  # Telegram Stars
+        prices=[LabeledPrice(label=name, amount=price)],
+        provider_token="",
+    )
+
+
+async def send_key(message: Message, user_id: int):
+    try:
+        user = await panel.get_user(uname(user_id))
+    except Exception:
+        logging.exception("panel error")
+        await message.answer("Сервер временно недоступен, попробуй чуть позже.")
+        return
+    if not user or (user.get("expire") and user["expire"] < time.time()):
+        await message.answer("Подписка не активна. Выбери тариф:", reply_markup=tariffs_kb())
+        return
+    left = (max(0, user["expire"] - int(time.time())) // 86400) if user.get("expire") else "∞"
+    await message.answer(
+        f"✅ Подписка активна, осталось дней: <b>{left}</b>\n\n"
+        f"Твоя ссылка (нажми, чтобы скопировать):\n<code>{sub_link(user)}</code>\n\n"
+        "Вставь её в Happ, Streisand или Hiddify: «Добавить подписку из буфера».",
+        parse_mode="HTML",
+    )
+
+
+@dp.message(CommandStart())
+async def cmd_start(message: Message, command: CommandObject):
+    arg = command.args or ""
+    if arg.startswith("buy_") and arg[4:] in PLANS:
+        return await send_invoice(message, arg[4:])
+    if arg == "buy":
+        return await message.answer("Выбери тариф:", reply_markup=tariffs_kb())
+    if arg == "key":
+        return await send_key(message, message.from_user.id)
+    await message.answer(
+        f"Привет, {message.from_user.first_name}! 👋\n\n"
+        "<b>SafeHome</b> — безопасный интернет в один тап.",
+        reply_markup=main_menu(),
+        parse_mode="HTML",
+    )
+
+
+@dp.message(Command("help"))
+async def cmd_help(message: Message):
+    await message.answer("/start — меню\n/buy — тарифы\n/key — моя ссылка")
+
+
+@dp.message(Command("buy"))
+async def cmd_buy(message: Message):
+    await message.answer("Выбери тариф:", reply_markup=tariffs_kb())
+
+
+@dp.message(Command("key"))
+async def cmd_key(message: Message):
+    await send_key(message, message.from_user.id)
+
+
+@dp.callback_query(F.data == "tariffs")
+async def cb_tariffs(cb: CallbackQuery):
+    await cb.message.answer("Выбери тариф:", reply_markup=tariffs_kb())
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "key")
+async def cb_key(cb: CallbackQuery):
+    await send_key(cb.message, cb.from_user.id)
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("buy:"))
+async def cb_buy(cb: CallbackQuery):
+    pid = cb.data.split(":", 1)[1]
+    if pid in PLANS:
+        await send_invoice(cb.message, pid)
+    await cb.answer()
+
+
+@dp.pre_checkout_query()
+async def pre_checkout(q: PreCheckoutQuery):
+    await q.answer(ok=q.invoice_payload in PLANS)
+
+
+@dp.message(F.successful_payment)
+async def paid(message: Message):
+    sp = message.successful_payment
+    _name, days, _price = PLANS[sp.invoice_payload]
+    try:
+        user = await panel.grant(uname(message.from_user.id), days)
+    except Exception:
+        logging.exception("grant failed")
+        await message.answer(
+            "Оплата прошла, но выдать ключ не удалось. Напиши в поддержку и "
+            f"укажи номер платежа: {sp.telegram_payment_charge_id}"
+        )
+        return
+    await message.answer(
+        "🎉 Оплата прошла! Подписка активна.\n\n"
+        f"Твоя ссылка:\n<code>{sub_link(user)}</code>\n\n"
+        "Вставь её в Happ, Streisand или Hiddify.",
+        parse_mode="HTML",
+    )
+
+
+async def main():
+    logging.basicConfig(level=logging.INFO)
+    bot = Bot(token=TOKEN)
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
